@@ -16,7 +16,9 @@ add_executable(simd_benchmark
 
 target_include_directories(simd_benchmark PRIVATE include)
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang|GNU")
+if(MSVC)
+    target_compile_options(simd_benchmark PRIVATE /W4)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang|GNU")
     target_compile_options(simd_benchmark PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
@@ -39,7 +41,15 @@ if(SIMD_PROCESSOR MATCHES "arm64|aarch64")
 elseif(SIMD_PROCESSOR MATCHES "x86_64|amd64")
     target_sources(simd_benchmark PRIVATE src/kernels_avx2.cpp)
 
-    if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang|GNU")
+    if(MSVC)
+        # MSVC's /arch:AVX2 also enables FMA code generation on supported CPUs.
+        set_source_files_properties(src/kernels_avx2.cpp PROPERTIES
+            COMPILE_OPTIONS "/arch:AVX2"
+        )
+        set_source_files_properties(src/kernels_auto.cpp PROPERTIES
+            COMPILE_OPTIONS "/arch:AVX2"
+        )
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang|GNU")
         # Apply AVX2/FMA to the explicit SIMD implementation and to the
         # auto-vectorized implementation, but not to the scalar baseline.
         set_source_files_properties(src/kernels_avx2.cpp PROPERTIES
@@ -49,7 +59,7 @@ elseif(SIMD_PROCESSOR MATCHES "x86_64|amd64")
             COMPILE_OPTIONS "-mavx2;-mfma"
         )
     else()
-        message(FATAL_ERROR "This starter project currently supports Clang or GCC on x86-64")
+        message(FATAL_ERROR "Unsupported x86-64 compiler: ${CMAKE_CXX_COMPILER_ID}")
     endif()
 
     message(STATUS "SIMD backend: x86 AVX2 + FMA")
@@ -69,5 +79,7 @@ if(ENABLE_VECTORIZATION_REPORTS)
             -fopt-info-vec-optimized
             -fopt-info-vec-missed
         )
+    elseif(MSVC)
+        target_compile_options(simd_benchmark PRIVATE /Qvec-report:2)
     endif()
 endif()
