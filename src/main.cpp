@@ -1,14 +1,16 @@
 #include "kernels.hpp"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <numbers>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -16,620 +18,673 @@
 
 namespace {
 
+using UnaryKernel = void (*)(const float*, float*, std::size_t);
+using BinaryKernel = void (*)(const float*, const float*, float*, std::size_t);
+using TriadKernel = void (*)(const float*, const float*, float*, float, std::size_t);
+using SaxpyKernel = void (*)(float, const float*, float*, std::size_t);
+using ReductionKernel = float (*)(const float*, const float*, std::size_t);
+using PolynomialKernel = void (*)(const float*, float*, std::size_t, const float*);
+using SmallGemmKernel = void (*)(const float*, const float*, float*, std::size_t);
+using LargeGemmKernel = void (*)(const float*, const float*, float*, std::size_t, std::size_t);
+using ConvolutionKernel = void (*)(const float*, const float*, float*, std::size_t, std::size_t);
+using FftKernel = void (*)(float*, float*, std::size_t, const float*, const float*);
+using GatherKernel = float (*)(const float*, const std::uint32_t*, std::size_t);
+using ScatterKernel = void (*)(const float*, const std::uint32_t*, float*, std::size_t);
+using HistogramKernel = void (*)(const std::uint32_t*, std::uint32_t*, std::size_t, std::size_t);
+
+constexpr double not_applicable = -1.0;
+
 struct BenchmarkResult {
     std::string implementation;
     double seconds{};
     double gb_per_second{};
-    bool reports_bandwidth{};
     double gflops{};
     double checksum{};
 };
 
-struct Configuration {
-    std::size_t element_count{std::size_t{1} << 20};
-    std::size_t vector_iterations{20};
-    std::size_t samples{5};
-    std::size_t matrix_dimension{192};
-    std::size_t matrix_iterations{2};
-};
-
-std::size_t parse_positive_size(const char* value, const char* argument_name) {
+std::size_t parse_positive_size(const char* value, const char* name) {
     try {
         const auto parsed = std::stoull(value);
-        if (parsed == 0) {
-            throw std::invalid_argument("zero");
+        if (parsed == 0 || parsed > std::numeric_limits<std::size_t>::max()) {
+            throw std::invalid_argument("out of range");
         }
         return static_cast<std::size_t>(parsed);
     } catch (...) {
-        throw std::invalid_argument(std::string(argument_name) + " must be a positive integer");
+        throw std::invalid_argument(std::string(name) + " must be a positive integer");
     }
 }
 
-double checksum(const float* values, const std::size_t count) {
+bool is_power_of_two(const std::size_t value) {
+    return value >= 2 && (value & (value - 1)) == 0;
+}
+
+double checksum(const std::vector<float>& values) {
     double sum = 0.0;
-    for (std::size_t i = 0; i < count; ++i) {
-        sum += static_cast<double>(values[i]);
-    }
+    for (const float value : values) sum += static_cast<double>(value);
     return sum;
 }
 
-void verify_values(
-    const std::string& name,
-    const float* actual,
-    const float* expected,
-    const std::size_t count,
-    const float absolute_tolerance,
-    const float relative_tolerance
+double checksum(const std::vector<std::uint32_t>& values) {
+    double sum = 0.0;
+    for (const std::uint32_t value : values) sum += static_cast<double>(value);
+    return sum;
+}
+
+void require_close(
+    const std::string& label,
+    const std::vector<float>& expected,
+    const std::vector<float>& actual,
+    const float absolute_tolerance = 1.0e-5F,
+    const float relative_tolerance = 1.0e-4F
 ) {
-    float maximum_absolute_error = 0.0F;
-    float maximum_relative_error = 0.0F;
-
-    for (std::size_t i = 0; i < count; ++i) {
-        const float difference = std::abs(actual[i] - expected[i]);
-        const float relative_error = difference / std::max(std::abs(expected[i]), 1.0e-12F);
-        maximum_absolute_error = std::max(maximum_absolute_error, difference);
-        maximum_relative_error = std::max(maximum_relative_error, relative_error);
-
-        if (difference > absolute_tolerance + relative_tolerance * std::abs(expected[i])) {
-            throw std::runtime_error(
-                name + " failed validation at index " + std::to_string(i) +
-                "; expected=" + std::to_string(expected[i]) +
-                ", actual=" + std::to_string(actual[i]) +
-                ", max abs error=" + std::to_string(maximum_absolute_error) +
-                ", max rel error=" + std::to_string(maximum_relative_error)
-            );
+    if (expected.size() != actual.size()) throw std::runtime_error(label + ": size mismatch");
+    float maximum_error = 0.0F;
+    std::size_t maximum_index = 0;
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        const float error = std::abs(expected[i] - actual[i]);
+        const float allowed = absolute_tolerance + relative_tolerance * std::max(std::abs(expected[i]), std::abs(actual[i]));
+        if (error > maximum_error) {
+            maximum_error = error;
+            maximum_index = i;
+        }
+        if (error > allowed) {
+            throw std::runtime_error(label + " failed validation at index " + std::to_string(i) +
+                                     "; expected=" + std::to_string(expected[i]) +
+                                     ", actual=" + std::to_string(actual[i]) +
+                                     ", error=" + std::to_string(error));
         }
     }
+    (void)maximum_error;
+    (void)maximum_index;
 }
 
-void verify_scalar_value(
-    const std::string& name,
-    const float actual,
+void require_close_scalar(
+    const std::string& label,
     const float expected,
-    const float absolute_tolerance,
-    const float relative_tolerance
+    const float actual,
+    const float absolute_tolerance = 1.0e-4F,
+    const float relative_tolerance = 2.0e-3F
 ) {
-    const float difference = std::abs(actual - expected);
-    if (difference > absolute_tolerance + relative_tolerance * std::abs(expected)) {
-        throw std::runtime_error(
-            name + " failed validation; expected=" + std::to_string(expected) +
-            ", actual=" + std::to_string(actual) +
-            ", difference=" + std::to_string(difference)
-        );
+    const float error = std::abs(expected - actual);
+    const float allowed = absolute_tolerance + relative_tolerance * std::max(std::abs(expected), std::abs(actual));
+    if (error > allowed) {
+        throw std::runtime_error(label + " failed validation; expected=" + std::to_string(expected) +
+                                 ", actual=" + std::to_string(actual) +
+                                 ", error=" + std::to_string(error));
     }
 }
 
-template <typename Prepare, typename Run, typename Consume>
+template <typename Setup, typename Operation, typename Digest>
 BenchmarkResult measure(
     std::string implementation,
+    Setup&& setup,
+    Operation&& operation,
+    Digest&& digest,
     const std::size_t iterations,
     const std::size_t samples,
-    const double floating_point_operations_per_call,
-    const double bytes_per_call,
-    Prepare&& prepare,
-    Run&& run,
-    Consume&& consume
+    const double bytes_per_iteration,
+    const double flops_per_iteration
 ) {
     using Clock = std::chrono::steady_clock;
 
-    // Warm-up calls are intentionally outside measured samples.
-    for (int warmup = 0; warmup < 2; ++warmup) {
-        prepare();
-        run();
-    }
+    setup();
+    operation();
 
     std::vector<double> timings;
     timings.reserve(samples);
-    double final_checksum = 0.0;
-
     for (std::size_t sample = 0; sample < samples; ++sample) {
-        prepare();
-
+        setup();
         const auto start = Clock::now();
-        for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
-            run();
-        }
+        for (std::size_t iteration = 0; iteration < iterations; ++iteration) operation();
         const auto end = Clock::now();
-
         timings.push_back(std::chrono::duration<double>(end - start).count());
-        final_checksum = consume();
     }
 
     std::sort(timings.begin(), timings.end());
-    const double median_seconds = timings[timings.size() / 2];
-    const double total_calls = static_cast<double>(iterations);
+    const double seconds = timings[timings.size() / 2];
+    const double total_bytes = bytes_per_iteration * static_cast<double>(iterations);
+    const double total_flops = flops_per_iteration * static_cast<double>(iterations);
 
-    BenchmarkResult result;
-    result.implementation = std::move(implementation);
-    result.seconds = median_seconds;
-    result.gflops = floating_point_operations_per_call * total_calls / median_seconds / 1.0e9;
-    result.checksum = final_checksum;
-
-    if (bytes_per_call > 0.0) {
-        result.gb_per_second = bytes_per_call * total_calls / median_seconds / 1.0e9;
-        result.reports_bandwidth = true;
-    }
-
-    return result;
+    return {
+        .implementation = std::move(implementation),
+        .seconds = seconds,
+        .gb_per_second = bytes_per_iteration < 0.0 ? not_applicable : total_bytes / seconds / 1.0e9,
+        .gflops = flops_per_iteration < 0.0 ? not_applicable : total_flops / seconds / 1.0e9,
+        .checksum = digest(),
+    };
 }
 
-void print_suite(
-    const std::string& title,
-    const std::string& formula,
-    const std::vector<BenchmarkResult>& results
+void print_metric(
+    const double value,
+    const int width,
+    const int precision,
+    const bool negative_means_not_applicable = false
 ) {
-    const double scalar_seconds = results.front().seconds;
+    if (negative_means_not_applicable && value < 0.0) {
+        std::cout << std::setw(width) << "-";
+    } else {
+        std::cout << std::setw(width) << std::fixed << std::setprecision(precision) << value;
+    }
+}
 
-    std::cout << "\n=== " << title << " ===\n"
-              << formula << '\n'
-              << std::left << std::setw(20) << "implementation"
-              << std::right << std::setw(13) << "seconds"
-              << std::setw(13) << "GB/s*"
-              << std::setw(13) << "GFLOP/s"
+void print_triplet(
+    const std::string& title,
+    const BenchmarkResult& scalar,
+    const BenchmarkResult& automatic,
+    const BenchmarkResult& native
+) {
+    std::cout << "\n" << title << '\n'
+              << std::left << std::setw(18) << "implementation"
+              << std::right << std::setw(12) << "seconds"
+              << std::setw(12) << "GB/s"
+              << std::setw(12) << "GFLOP/s"
               << std::setw(12) << "speedup"
-              << std::setw(20) << "checksum" << '\n';
+              << std::setw(18) << "checksum" << '\n';
 
-    for (const BenchmarkResult& result : results) {
-        std::cout << std::left << std::setw(20) << result.implementation
-                  << std::right << std::fixed << std::setprecision(6)
-                  << std::setw(13) << result.seconds;
-
-        if (!result.reports_bandwidth) {
-            std::cout << std::setw(13) << "-";
-        } else {
-            std::cout << std::setprecision(2) << std::setw(13) << result.gb_per_second;
-        }
-
-        std::cout << std::setprecision(2) << std::setw(13) << result.gflops
-                  << std::setw(12) << scalar_seconds / result.seconds
-                  << std::setprecision(5) << std::setw(20) << result.checksum
-                  << '\n';
+    for (const BenchmarkResult* result : {&scalar, &automatic, &native}) {
+        std::cout << std::left << std::setw(18) << result->implementation << std::right;
+        print_metric(result->seconds, 12, 6);
+        print_metric(result->gb_per_second, 12, 2, true);
+        print_metric(result->gflops, 12, 2, true);
+        print_metric(scalar.seconds / result->seconds, 12, 2);
+        print_metric(result->checksum, 18, 4);
+        std::cout << '\n';
     }
 }
 
-BenchmarkResult benchmark_binary(
-    const std::string& implementation,
-    const BinaryKernel kernel,
-    const std::vector<float>& lhs,
-    const std::vector<float>& rhs,
-    std::vector<float>& output,
+void run_unary_vector_kernel(
+    const std::string& title,
+    const UnaryKernel scalar_kernel,
+    const UnaryKernel auto_kernel,
+    const UnaryKernel native_kernel,
+    const std::vector<float>& input,
     const std::size_t iterations,
-    const std::size_t samples
+    const std::size_t samples,
+    const double bytes_per_element,
+    const double flops_per_element
 ) {
-    const double operations = static_cast<double>(lhs.size());
-    const double bytes = 3.0 * sizeof(float) * static_cast<double>(lhs.size());
+    std::vector<float> expected(input.size());
+    std::vector<float> actual(input.size());
+    scalar_kernel(input.data(), expected.data(), input.size());
+    auto_kernel(input.data(), actual.data(), input.size());
+    require_close(title + " auto", expected, actual);
+    native_kernel(input.data(), actual.data(), input.size());
+    require_close(title + " SIMD", expected, actual);
 
-    return measure(
-        implementation,
-        iterations,
-        samples,
-        operations,
-        bytes,
-        [] {},
-        [&] { kernel(lhs.data(), rhs.data(), output.data(), lhs.size()); },
-        [&] { return checksum(output.data(), output.size()); }
-    );
+    std::vector<float> output(input.size());
+    const auto benchmark = [&](const char* name, const UnaryKernel kernel) {
+        return measure(name,
+            [&] { std::fill(output.begin(), output.end(), 0.0F); },
+            [&] { kernel(input.data(), output.data(), input.size()); },
+            [&] { return checksum(output); },
+            iterations, samples,
+            bytes_per_element * static_cast<double>(input.size()),
+            flops_per_element * static_cast<double>(input.size()));
+    };
+    const auto scalar = benchmark("scalar", scalar_kernel);
+    const auto automatic = benchmark("auto-vectorized", auto_kernel);
+    const auto native = benchmark("manual SIMD", native_kernel);
+    print_triplet(title, scalar, automatic, native);
 }
 
-void run_binary_suite(
+void run_binary_vector_kernel(
     const std::string& title,
-    const std::string& formula,
     const BinaryKernel scalar_kernel,
     const BinaryKernel auto_kernel,
-    const BinaryKernel simd_kernel,
+    const BinaryKernel native_kernel,
+    const std::vector<float>& lhs,
+    const std::vector<float>& rhs,
+    const std::size_t iterations,
+    const std::size_t samples,
+    const double flops_per_element
+) {
+    std::vector<float> expected(lhs.size());
+    std::vector<float> actual(lhs.size());
+    scalar_kernel(lhs.data(), rhs.data(), expected.data(), lhs.size());
+    auto_kernel(lhs.data(), rhs.data(), actual.data(), lhs.size());
+    require_close(title + " auto", expected, actual, 2.0e-5F, 2.0e-4F);
+    native_kernel(lhs.data(), rhs.data(), actual.data(), lhs.size());
+    require_close(title + " SIMD", expected, actual, 2.0e-5F, 2.0e-4F);
+
+    std::vector<float> output(lhs.size());
+    const auto benchmark = [&](const char* name, const BinaryKernel kernel) {
+        return measure(name,
+            [&] { std::fill(output.begin(), output.end(), 0.0F); },
+            [&] { kernel(lhs.data(), rhs.data(), output.data(), lhs.size()); },
+            [&] { return checksum(output); },
+            iterations, samples,
+            3.0 * sizeof(float) * static_cast<double>(lhs.size()),
+            flops_per_element * static_cast<double>(lhs.size()));
+    };
+    const auto scalar = benchmark("scalar", scalar_kernel);
+    const auto automatic = benchmark("auto-vectorized", auto_kernel);
+    const auto native = benchmark("manual SIMD", native_kernel);
+    print_triplet(title, scalar, automatic, native);
+}
+
+void run_triad(
     const std::vector<float>& lhs,
     const std::vector<float>& rhs,
     const std::size_t iterations,
     const std::size_t samples
 ) {
-    std::vector<float> reference(lhs.size());
+    constexpr float scale = 0.375F;
+    std::vector<float> expected(lhs.size());
     std::vector<float> actual(lhs.size());
+    vector_triad_scalar(lhs.data(), rhs.data(), expected.data(), scale, lhs.size());
+    vector_triad_auto(lhs.data(), rhs.data(), actual.data(), scale, lhs.size());
+    require_close("STREAM triad auto", expected, actual);
+    vector_triad_native_simd(lhs.data(), rhs.data(), actual.data(), scale, lhs.size());
+    require_close("STREAM triad SIMD", expected, actual);
 
-    scalar_kernel(lhs.data(), rhs.data(), reference.data(), lhs.size());
-    auto_kernel(lhs.data(), rhs.data(), actual.data(), lhs.size());
-    verify_values(title + " auto", actual.data(), reference.data(), actual.size(), 1.0e-6F, 1.0e-6F);
-    simd_kernel(lhs.data(), rhs.data(), actual.data(), lhs.size());
-    verify_values(title + " SIMD", actual.data(), reference.data(), actual.size(), 1.0e-6F, 1.0e-6F);
-
-    std::vector<BenchmarkResult> results;
-    results.reserve(3);
-    results.push_back(benchmark_binary("scalar", scalar_kernel, lhs, rhs, actual, iterations, samples));
-    results.push_back(benchmark_binary("auto-vectorized", auto_kernel, lhs, rhs, actual, iterations, samples));
-    results.push_back(benchmark_binary("manual SIMD", simd_kernel, lhs, rhs, actual, iterations, samples));
-    print_suite(title, formula, results);
+    std::vector<float> output(lhs.size());
+    const auto benchmark = [&](const char* name, const TriadKernel kernel) {
+        return measure(name,
+            [&] { std::fill(output.begin(), output.end(), 0.0F); },
+            [&] { kernel(lhs.data(), rhs.data(), output.data(), scale, lhs.size()); },
+            [&] { return checksum(output); },
+            iterations, samples,
+            3.0 * sizeof(float) * static_cast<double>(lhs.size()),
+            2.0 * static_cast<double>(lhs.size()));
+    };
+    print_triplet("STREAM triad", benchmark("scalar", vector_triad_scalar),
+                  benchmark("auto-vectorized", vector_triad_auto),
+                  benchmark("manual SIMD", vector_triad_native_simd));
 }
 
-BenchmarkResult benchmark_saxpy(
-    const std::string& implementation,
-    const SaxpyKernel kernel,
-    const float scale,
-    const std::vector<float>& x,
-    const std::vector<float>& initial_y,
-    std::vector<float>& y,
-    const std::size_t iterations,
-    const std::size_t samples
-) {
-    const double operations = 2.0 * static_cast<double>(x.size());
-    const double bytes = 3.0 * sizeof(float) * static_cast<double>(x.size());
-
-    return measure(
-        implementation,
-        iterations,
-        samples,
-        operations,
-        bytes,
-        [&] { y = initial_y; },
-        [&] { kernel(scale, x.data(), y.data(), y.size()); },
-        [&] { return checksum(y.data(), y.size()); }
-    );
-}
-
-void run_saxpy_suite(
+void run_saxpy(
     const std::vector<float>& x,
     const std::vector<float>& initial_y,
     const std::size_t iterations,
     const std::size_t samples
 ) {
     constexpr float scale = 0.25F;
-    std::vector<float> reference = initial_y;
+    std::vector<float> expected = initial_y;
     std::vector<float> actual = initial_y;
-
-    saxpy_scalar(scale, x.data(), reference.data(), reference.size());
-    saxpy_auto(scale, x.data(), actual.data(), actual.size());
-    verify_values("SAXPY auto", actual.data(), reference.data(), actual.size(), 1.0e-6F, 1.0e-6F);
+    saxpy_scalar(scale, x.data(), expected.data(), x.size());
+    saxpy_auto(scale, x.data(), actual.data(), x.size());
+    require_close("SAXPY auto", expected, actual);
     actual = initial_y;
-    saxpy_native_simd(scale, x.data(), actual.data(), actual.size());
-    verify_values("SAXPY SIMD", actual.data(), reference.data(), actual.size(), 1.0e-6F, 1.0e-6F);
+    saxpy_native_simd(scale, x.data(), actual.data(), x.size());
+    require_close("SAXPY SIMD", expected, actual);
 
-    std::vector<BenchmarkResult> results;
-    results.reserve(3);
-    results.push_back(benchmark_saxpy("scalar", saxpy_scalar, scale, x, initial_y, actual, iterations, samples));
-    results.push_back(benchmark_saxpy("auto-vectorized", saxpy_auto, scale, x, initial_y, actual, iterations, samples));
-    results.push_back(benchmark_saxpy("manual SIMD", saxpy_native_simd, scale, x, initial_y, actual, iterations, samples));
-    print_suite("SAXPY / scaled vector addition", "y[i] = scale * x[i] + y[i]", results);
+    std::vector<float> y = initial_y;
+    const auto benchmark = [&](const char* name, const SaxpyKernel kernel) {
+        return measure(name,
+            [&] { y = initial_y; },
+            [&] { kernel(scale, x.data(), y.data(), x.size()); },
+            [&] { return checksum(y); },
+            iterations, samples,
+            3.0 * sizeof(float) * static_cast<double>(x.size()),
+            2.0 * static_cast<double>(x.size()));
+    };
+    print_triplet("SAXPY update", benchmark("scalar", saxpy_scalar),
+                  benchmark("auto-vectorized", saxpy_auto),
+                  benchmark("manual SIMD", saxpy_native_simd));
 }
 
-BenchmarkResult benchmark_dot(
-    const std::string& implementation,
-    const DotKernel kernel,
+void run_dot_product(
     const std::vector<float>& lhs,
     const std::vector<float>& rhs,
     const std::size_t iterations,
     const std::size_t samples
 ) {
-    float accumulated_result = 0.0F;
-    const double operations = 2.0 * static_cast<double>(lhs.size());
-    const double bytes = 2.0 * sizeof(float) * static_cast<double>(lhs.size());
+    const float expected = dot_product_scalar(lhs.data(), rhs.data(), lhs.size());
+    require_close_scalar("dot product auto", expected, dot_product_auto(lhs.data(), rhs.data(), lhs.size()));
+    require_close_scalar("dot product SIMD", expected, dot_product_native_simd(lhs.data(), rhs.data(), lhs.size()));
 
-    return measure(
-        implementation,
-        iterations,
-        samples,
-        operations,
-        bytes,
-        [&] { accumulated_result = 0.0F; },
-        [&] { accumulated_result += kernel(lhs.data(), rhs.data(), lhs.size()); },
-        [&] { return static_cast<double>(accumulated_result); }
-    );
+    float result = 0.0F;
+    const auto benchmark = [&](const char* name, const ReductionKernel kernel) {
+        return measure(name, [] {},
+            [&] { result = kernel(lhs.data(), rhs.data(), lhs.size()); },
+            [&] { return static_cast<double>(result); },
+            iterations, samples,
+            2.0 * sizeof(float) * static_cast<double>(lhs.size()),
+            2.0 * static_cast<double>(lhs.size()));
+    };
+    print_triplet("Dot product / reduction", benchmark("scalar", dot_product_scalar),
+                  benchmark("auto-vectorized", dot_product_auto),
+                  benchmark("manual SIMD", dot_product_native_simd));
 }
 
-void run_dot_suite(
-    const std::vector<float>& lhs,
-    const std::vector<float>& rhs,
-    const std::size_t iterations,
-    const std::size_t samples
-) {
-    const float reference = dot_product_scalar(lhs.data(), rhs.data(), lhs.size());
-    verify_scalar_value(
-        "Dot product auto",
-        dot_product_auto(lhs.data(), rhs.data(), lhs.size()),
-        reference,
-        1.0e-2F,
-        5.0e-3F
-    );
-    verify_scalar_value(
-        "Dot product SIMD",
-        dot_product_native_simd(lhs.data(), rhs.data(), lhs.size()),
-        reference,
-        1.0e-2F,
-        5.0e-3F
-    );
-
-    std::vector<BenchmarkResult> results;
-    results.reserve(3);
-    results.push_back(benchmark_dot("scalar", dot_product_scalar, lhs, rhs, iterations, samples));
-    results.push_back(benchmark_dot("auto-vectorized", dot_product_auto, lhs, rhs, iterations, samples));
-    results.push_back(benchmark_dot("manual SIMD", dot_product_native_simd, lhs, rhs, iterations, samples));
-    print_suite("Dot product / reduction", "sum(lhs[i] * rhs[i])", results);
-}
-
-BenchmarkResult benchmark_polynomial(
-    const std::string& implementation,
-    const PolynomialKernel kernel,
-    const std::vector<float>& input,
-    std::vector<float>& output,
-    const std::array<float, 5>& coefficients,
-    const std::size_t iterations,
-    const std::size_t samples
-) {
-    const double operations = 8.0 * static_cast<double>(input.size());
-    const double bytes = 2.0 * sizeof(float) * static_cast<double>(input.size());
-
-    return measure(
-        implementation,
-        iterations,
-        samples,
-        operations,
-        bytes,
-        [] {},
-        [&] { kernel(input.data(), output.data(), input.size(), coefficients.data()); },
-        [&] { return checksum(output.data(), output.size()); }
-    );
-}
-
-void run_polynomial_suite(
+void run_polynomial(
     const std::vector<float>& input,
     const std::size_t iterations,
     const std::size_t samples
 ) {
-    constexpr std::array<float, 5> coefficients{0.75F, -0.5F, 0.25F, -0.125F, 0.0625F};
-    std::vector<float> reference(input.size());
+    const float coefficients[5] = {0.75F, -0.25F, 0.125F, 0.0625F, -0.03125F};
+    std::vector<float> expected(input.size());
     std::vector<float> actual(input.size());
+    polynomial_scalar(input.data(), expected.data(), input.size(), coefficients);
+    polynomial_auto(input.data(), actual.data(), input.size(), coefficients);
+    require_close("polynomial auto", expected, actual, 2.0e-5F, 3.0e-4F);
+    polynomial_native_simd(input.data(), actual.data(), input.size(), coefficients);
+    require_close("polynomial SIMD", expected, actual, 2.0e-5F, 3.0e-4F);
 
-    polynomial_scalar(input.data(), reference.data(), input.size(), coefficients.data());
-    polynomial_auto(input.data(), actual.data(), input.size(), coefficients.data());
-    verify_values("Polynomial auto", actual.data(), reference.data(), actual.size(), 1.0e-5F, 1.0e-5F);
-    polynomial_native_simd(input.data(), actual.data(), input.size(), coefficients.data());
-    verify_values("Polynomial SIMD", actual.data(), reference.data(), actual.size(), 1.0e-5F, 1.0e-5F);
-
-    std::vector<BenchmarkResult> results;
-    results.reserve(3);
-    results.push_back(benchmark_polynomial("scalar", polynomial_scalar, input, actual, coefficients, iterations, samples));
-    results.push_back(benchmark_polynomial("auto-vectorized", polynomial_auto, input, actual, coefficients, iterations, samples));
-    results.push_back(benchmark_polynomial("manual SIMD", polynomial_native_simd, input, actual, coefficients, iterations, samples));
-    print_suite(
-        "FMA-heavy polynomial",
-        "((((c4 * x + c3) * x + c2) * x + c1) * x + c0)",
-        results
-    );
+    std::vector<float> output(input.size());
+    const auto benchmark = [&](const char* name, const PolynomialKernel kernel) {
+        return measure(name,
+            [&] { std::fill(output.begin(), output.end(), 0.0F); },
+            [&] { kernel(input.data(), output.data(), input.size(), coefficients); },
+            [&] { return checksum(output); },
+            iterations, samples,
+            2.0 * sizeof(float) * static_cast<double>(input.size()),
+            8.0 * static_cast<double>(input.size()));
+    };
+    print_triplet("Horner polynomial (FMA-heavy)", benchmark("scalar", polynomial_scalar),
+                  benchmark("auto-vectorized", polynomial_auto),
+                  benchmark("manual SIMD", polynomial_native_simd));
 }
 
-BenchmarkResult benchmark_matrix(
-    const std::string& implementation,
-    const MatrixMultiplyKernel kernel,
-    const std::vector<float>& lhs,
-    const std::vector<float>& rhs_transposed,
-    std::vector<float>& output,
-    const std::size_t dimension,
-    const std::size_t iterations,
-    const std::size_t samples
-) {
-    const double n = static_cast<double>(dimension);
-    const double operations = 2.0 * n * n * n;
-
-    return measure(
-        implementation,
-        iterations,
-        samples,
-        operations,
-        0.0,
-        [] {},
-        [&] { kernel(lhs.data(), rhs_transposed.data(), output.data(), dimension); },
-        [&] { return checksum(output.data(), output.size()); }
-    );
+std::vector<float> make_matrix(const std::size_t dimension, const std::size_t seed) {
+    std::vector<float> matrix(dimension * dimension);
+    for (std::size_t i = 0; i < matrix.size(); ++i) {
+        const int value = static_cast<int>((i * (seed * 17 + 3) + seed * 11) % 97) - 48;
+        matrix[i] = static_cast<float>(value) * 0.01F;
+    }
+    return matrix;
 }
 
-void run_matrix_suite(
-    const std::size_t dimension,
-    const std::size_t iterations,
-    const std::size_t samples
-) {
-    const std::size_t matrix_elements = dimension * dimension;
-    std::vector<float> lhs(matrix_elements);
-    std::vector<float> rhs(matrix_elements);
-    std::vector<float> rhs_transposed(matrix_elements);
-    std::vector<float> reference(matrix_elements);
-    std::vector<float> actual(matrix_elements);
-
+std::vector<float> transpose(const std::vector<float>& matrix, const std::size_t dimension) {
+    std::vector<float> result(matrix.size());
     for (std::size_t row = 0; row < dimension; ++row) {
         for (std::size_t column = 0; column < dimension; ++column) {
-            const std::size_t index = row * dimension + column;
-            lhs[index] = static_cast<float>(static_cast<int>((row * 13 + column * 7) % 97) - 48) * 0.002F;
-            rhs[index] = static_cast<float>(static_cast<int>((row * 5 + column * 11) % 89) - 44) * 0.0025F;
-            rhs_transposed[column * dimension + row] = rhs[index];
+            result[column * dimension + row] = matrix[row * dimension + column];
         }
     }
+    return result;
+}
 
-    matrix_multiply_scalar(lhs.data(), rhs_transposed.data(), reference.data(), dimension);
+void run_small_gemm(const std::size_t dimension, const std::size_t samples) {
+    const auto lhs = make_matrix(dimension, 1);
+    const auto rhs = make_matrix(dimension, 2);
+    const auto rhs_transposed = transpose(rhs, dimension);
+    std::vector<float> expected(dimension * dimension);
+    std::vector<float> actual(dimension * dimension);
+    matrix_multiply_scalar(lhs.data(), rhs_transposed.data(), expected.data(), dimension);
     matrix_multiply_auto(lhs.data(), rhs_transposed.data(), actual.data(), dimension);
-    verify_values("Matrix multiply auto", actual.data(), reference.data(), actual.size(), 1.0e-4F, 5.0e-4F);
+    require_close("small GEMM auto", expected, actual, 2.0e-4F, 2.0e-3F);
     matrix_multiply_native_simd(lhs.data(), rhs_transposed.data(), actual.data(), dimension);
-    verify_values("Matrix multiply SIMD", actual.data(), reference.data(), actual.size(), 1.0e-4F, 5.0e-4F);
+    require_close("small GEMM SIMD", expected, actual, 2.0e-4F, 2.0e-3F);
 
-    std::vector<BenchmarkResult> results;
-    results.reserve(3);
-    results.push_back(benchmark_matrix(
-        "scalar", matrix_multiply_scalar, lhs, rhs_transposed, actual,
-        dimension, iterations, samples));
-    results.push_back(benchmark_matrix(
-        "auto-vectorized", matrix_multiply_auto, lhs, rhs_transposed, actual,
-        dimension, iterations, samples));
-    results.push_back(benchmark_matrix(
-        "manual SIMD", matrix_multiply_native_simd, lhs, rhs_transposed, actual,
-        dimension, iterations, samples));
-    print_suite(
-        "Square matrix multiplication",
-        "C = A * B, with B transposed once before timing; dimension = " + std::to_string(dimension),
-        results
-    );
-}
-
-BenchmarkResult benchmark_convolution(
-    const std::string& implementation,
-    const ConvolutionKernel kernel,
-    const std::vector<float>& input,
-    const std::vector<float>& filter,
-    std::vector<float>& output,
-    const std::size_t iterations,
-    const std::size_t samples
-) {
-    const double output_count = static_cast<double>(output.size());
-    const double operations = 2.0 * output_count * static_cast<double>(filter.size());
-
-    return measure(
-        implementation,
-        iterations,
-        samples,
-        operations,
-        0.0,
-        [] {},
-        [&] {
-            kernel(
-                input.data(), filter.data(), output.data(), input.size(), filter.size());
-        },
-        [&] { return checksum(output.data(), output.size()); }
-    );
-}
-
-void run_convolution_suite(
-    const std::vector<float>& input,
-    const std::size_t iterations,
-    const std::size_t samples
-) {
-    constexpr std::array<float, 7> filter_values{
-        -0.03125F, 0.125F, 0.28125F, 0.25F, 0.28125F, 0.125F, -0.03125F
+    std::vector<float> output(dimension * dimension);
+    const std::size_t iterations = dimension <= 64 ? 3 : 1;
+    const double flops = 2.0 * static_cast<double>(dimension) * dimension * dimension;
+    const auto benchmark = [&](const char* name, const SmallGemmKernel kernel) {
+        return measure(name,
+            [&] { std::fill(output.begin(), output.end(), 0.0F); },
+            [&] { kernel(lhs.data(), rhs_transposed.data(), output.data(), dimension); },
+            [&] { return checksum(output); },
+            iterations, samples, not_applicable, flops);
     };
-    const std::vector<float> filter(filter_values.begin(), filter_values.end());
-    const std::size_t output_count = input.size() - filter.size() + 1;
-    std::vector<float> reference(output_count);
-    std::vector<float> actual(output_count);
-
-    convolution_1d_scalar(
-        input.data(), filter.data(), reference.data(), input.size(), filter.size());
-    convolution_1d_auto(
-        input.data(), filter.data(), actual.data(), input.size(), filter.size());
-    verify_values("Convolution auto", actual.data(), reference.data(), actual.size(), 1.0e-5F, 1.0e-4F);
-    convolution_1d_native_simd(
-        input.data(), filter.data(), actual.data(), input.size(), filter.size());
-    verify_values("Convolution SIMD", actual.data(), reference.data(), actual.size(), 1.0e-5F, 1.0e-4F);
-
-    std::vector<BenchmarkResult> results;
-    results.reserve(3);
-    results.push_back(benchmark_convolution(
-        "scalar", convolution_1d_scalar, input, filter, actual, iterations, samples));
-    results.push_back(benchmark_convolution(
-        "auto-vectorized", convolution_1d_auto, input, filter, actual, iterations, samples));
-    results.push_back(benchmark_convolution(
-        "manual SIMD", convolution_1d_native_simd, input, filter, actual, iterations, samples));
-    print_suite(
-        "Valid 1D convolution",
-        "7-tap finite impulse response filter; output count = " + std::to_string(output_count),
-        results
-    );
+    print_triplet("Small GEMM " + std::to_string(dimension) + "x" + std::to_string(dimension),
+                  benchmark("scalar", matrix_multiply_scalar),
+                  benchmark("auto-vectorized", matrix_multiply_auto),
+                  benchmark("manual SIMD", matrix_multiply_native_simd));
 }
 
-Configuration parse_configuration(const int argc, char** argv) {
-    Configuration configuration;
+void run_large_gemm(const std::size_t dimension, const std::size_t samples) {
+    constexpr std::size_t block_size = 64;
+    const auto lhs = make_matrix(dimension, 3);
+    const auto rhs = make_matrix(dimension, 4);
+    std::vector<float> expected(dimension * dimension);
+    std::vector<float> actual(dimension * dimension);
+    matrix_multiply_blocked_scalar(lhs.data(), rhs.data(), expected.data(), dimension, block_size);
+    matrix_multiply_blocked_auto(lhs.data(), rhs.data(), actual.data(), dimension, block_size);
+    require_close("large GEMM auto", expected, actual, 4.0e-4F, 3.0e-3F);
+    matrix_multiply_blocked_native_simd(lhs.data(), rhs.data(), actual.data(), dimension, block_size);
+    require_close("large GEMM SIMD", expected, actual, 4.0e-4F, 3.0e-3F);
 
-    if (argc > 1) {
-        configuration.element_count = parse_positive_size(argv[1], "element_count");
+    std::vector<float> output(dimension * dimension);
+    const double flops = 2.0 * static_cast<double>(dimension) * dimension * dimension;
+    const auto benchmark = [&](const char* name, const LargeGemmKernel kernel) {
+        return measure(name, [] {},
+            [&] { kernel(lhs.data(), rhs.data(), output.data(), dimension, block_size); },
+            [&] { return checksum(output); },
+            1, samples, not_applicable, flops);
+    };
+    print_triplet("Large blocked GEMM " + std::to_string(dimension) + "x" + std::to_string(dimension),
+                  benchmark("scalar", matrix_multiply_blocked_scalar),
+                  benchmark("auto-vectorized", matrix_multiply_blocked_auto),
+                  benchmark("manual SIMD", matrix_multiply_blocked_native_simd));
+}
+
+void run_convolution(
+    const std::vector<float>& input,
+    const std::size_t iterations,
+    const std::size_t samples
+) {
+    const std::vector<float> filter = {0.05F, 0.1F, 0.2F, 0.3F, 0.2F, 0.1F, 0.05F};
+    const std::size_t output_count = input.size() - filter.size() + 1;
+    std::vector<float> expected(output_count);
+    std::vector<float> actual(output_count);
+    convolution_1d_scalar(input.data(), filter.data(), expected.data(), input.size(), filter.size());
+    convolution_1d_auto(input.data(), filter.data(), actual.data(), input.size(), filter.size());
+    require_close("convolution auto", expected, actual, 2.0e-5F, 3.0e-4F);
+    convolution_1d_native_simd(input.data(), filter.data(), actual.data(), input.size(), filter.size());
+    require_close("convolution SIMD", expected, actual, 2.0e-5F, 3.0e-4F);
+
+    std::vector<float> output(output_count);
+    const double flops = 2.0 * static_cast<double>(output_count) * filter.size();
+    const auto benchmark = [&](const char* name, const ConvolutionKernel kernel) {
+        return measure(name,
+            [&] { std::fill(output.begin(), output.end(), 0.0F); },
+            [&] { kernel(input.data(), filter.data(), output.data(), input.size(), filter.size()); },
+            [&] { return checksum(output); },
+            iterations, samples, not_applicable, flops);
+    };
+    print_triplet("1D convolution (7 taps)", benchmark("scalar", convolution_1d_scalar),
+                  benchmark("auto-vectorized", convolution_1d_auto),
+                  benchmark("manual SIMD", convolution_1d_native_simd));
+}
+
+void run_fft(const std::size_t count, const std::size_t samples) {
+    std::vector<float> initial_real(count);
+    std::vector<float> initial_imaginary(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const double angle = 2.0 * std::numbers::pi * static_cast<double>(i) / static_cast<double>(count);
+        initial_real[i] = static_cast<float>(0.7 * std::sin(3.0 * angle) + 0.2 * std::cos(17.0 * angle));
+        initial_imaginary[i] = static_cast<float>(0.1 * std::sin(5.0 * angle));
     }
-    if (argc > 2) {
-        configuration.vector_iterations = parse_positive_size(argv[2], "vector_iterations");
-    }
-    if (argc > 3) {
-        configuration.samples = parse_positive_size(argv[3], "samples");
-    }
-    if (argc > 4) {
-        configuration.matrix_dimension = parse_positive_size(argv[4], "matrix_dimension");
-    }
-    if (argc > 5) {
-        configuration.matrix_iterations = parse_positive_size(argv[5], "matrix_iterations");
-    }
-    if (argc > 6) {
-        throw std::invalid_argument("too many arguments");
-    }
-    if (configuration.samples % 2 == 0) {
-        throw std::invalid_argument("samples must be odd so the median is unambiguous");
-    }
-    if (configuration.element_count < 7) {
-        throw std::invalid_argument("element_count must be at least 7 for the convolution kernel");
-    }
-    if (configuration.matrix_dimension >
-        std::numeric_limits<std::size_t>::max() / configuration.matrix_dimension) {
-        throw std::invalid_argument("matrix_dimension is too large");
+    std::vector<float> twiddle_real(count / 2);
+    std::vector<float> twiddle_imaginary(count / 2);
+    for (std::size_t k = 0; k < count / 2; ++k) {
+        const double angle = -2.0 * std::numbers::pi * static_cast<double>(k) / static_cast<double>(count);
+        twiddle_real[k] = static_cast<float>(std::cos(angle));
+        twiddle_imaginary[k] = static_cast<float>(std::sin(angle));
     }
 
-    return configuration;
+    std::vector<float> expected_real = initial_real;
+    std::vector<float> expected_imaginary = initial_imaginary;
+    fft_radix2_scalar(expected_real.data(), expected_imaginary.data(), count, twiddle_real.data(), twiddle_imaginary.data());
+    std::vector<float> actual_real = initial_real;
+    std::vector<float> actual_imaginary = initial_imaginary;
+    fft_radix2_auto(actual_real.data(), actual_imaginary.data(), count, twiddle_real.data(), twiddle_imaginary.data());
+    require_close("FFT auto real", expected_real, actual_real, 2.0e-3F, 4.0e-3F);
+    require_close("FFT auto imaginary", expected_imaginary, actual_imaginary, 2.0e-3F, 4.0e-3F);
+    actual_real = initial_real;
+    actual_imaginary = initial_imaginary;
+    fft_radix2_native_simd(actual_real.data(), actual_imaginary.data(), count, twiddle_real.data(), twiddle_imaginary.data());
+    require_close("FFT SIMD real", expected_real, actual_real, 2.0e-3F, 4.0e-3F);
+    require_close("FFT SIMD imaginary", expected_imaginary, actual_imaginary, 2.0e-3F, 4.0e-3F);
+
+    std::vector<float> real = initial_real;
+    std::vector<float> imaginary = initial_imaginary;
+    const double stages = std::log2(static_cast<double>(count));
+    const double approximate_flops = 5.0 * static_cast<double>(count) * stages;
+    const auto benchmark = [&](const char* name, const FftKernel kernel) {
+        return measure(name,
+            [&] { real = initial_real; imaginary = initial_imaginary; },
+            [&] { kernel(real.data(), imaginary.data(), count, twiddle_real.data(), twiddle_imaginary.data()); },
+            [&] { return checksum(real) + checksum(imaginary); },
+            1, samples, not_applicable, approximate_flops);
+    };
+    print_triplet("Radix-2 FFT (N=" + std::to_string(count) + ")",
+                  benchmark("scalar", fft_radix2_scalar),
+                  benchmark("auto-vectorized", fft_radix2_auto),
+                  benchmark("manual SIMD", fft_radix2_native_simd));
+}
+
+void run_gather(
+    const std::vector<float>& values,
+    const std::vector<std::uint32_t>& indices,
+    const std::size_t iterations,
+    const std::size_t samples
+) {
+    const float expected = gather_sum_scalar(values.data(), indices.data(), indices.size());
+    require_close_scalar("gather auto", expected, gather_sum_auto(values.data(), indices.data(), indices.size()), 2.0e-3F, 3.0e-3F);
+    require_close_scalar("gather SIMD", expected, gather_sum_native_simd(values.data(), indices.data(), indices.size()), 2.0e-3F, 3.0e-3F);
+
+    float result = 0.0F;
+    const auto benchmark = [&](const char* name, const GatherKernel kernel) {
+        return measure(name, [] {},
+            [&] { result = kernel(values.data(), indices.data(), indices.size()); },
+            [&] { return static_cast<double>(result); },
+            iterations, samples,
+            (sizeof(float) + sizeof(std::uint32_t)) * static_cast<double>(indices.size()),
+            static_cast<double>(indices.size()));
+    };
+    print_triplet("Gather / indexed sum", benchmark("scalar", gather_sum_scalar),
+                  benchmark("auto-vectorized", gather_sum_auto),
+                  benchmark("manual SIMD", gather_sum_native_simd));
+}
+
+void run_scatter(
+    const std::vector<float>& values,
+    const std::vector<std::uint32_t>& indices,
+    const std::size_t output_count,
+    const std::size_t iterations,
+    const std::size_t samples
+) {
+    std::vector<float> expected(output_count, 0.0F);
+    std::vector<float> actual(output_count, 0.0F);
+    scatter_add_scalar(values.data(), indices.data(), expected.data(), values.size());
+    scatter_add_auto(values.data(), indices.data(), actual.data(), values.size());
+    require_close("scatter auto", expected, actual, 1.0e-5F, 1.0e-5F);
+    std::fill(actual.begin(), actual.end(), 0.0F);
+    scatter_add_native_simd(values.data(), indices.data(), actual.data(), values.size());
+    require_close("scatter SIMD", expected, actual, 1.0e-5F, 1.0e-5F);
+
+    std::vector<float> output(output_count);
+    const auto benchmark = [&](const char* name, const ScatterKernel kernel) {
+        return measure(name,
+            [&] { std::fill(output.begin(), output.end(), 0.0F); },
+            [&] { kernel(values.data(), indices.data(), output.data(), values.size()); },
+            [&] { return checksum(output); },
+            iterations, samples,
+            3.0 * sizeof(float) * static_cast<double>(values.size()),
+            static_cast<double>(values.size()));
+    };
+    print_triplet("Scatter-add with collisions", benchmark("scalar", scatter_add_scalar),
+                  benchmark("auto-vectorized", scatter_add_auto),
+                  benchmark("manual/hybrid", scatter_add_native_simd));
+}
+
+void run_histogram(
+    const std::vector<std::uint32_t>& values,
+    const std::size_t bin_count,
+    const std::size_t iterations,
+    const std::size_t samples
+) {
+    std::vector<std::uint32_t> expected(bin_count, 0);
+    std::vector<std::uint32_t> actual(bin_count, 0);
+    histogram_scalar(values.data(), expected.data(), values.size(), bin_count);
+    histogram_auto(values.data(), actual.data(), values.size(), bin_count);
+    if (expected != actual) throw std::runtime_error("histogram auto failed validation");
+    std::fill(actual.begin(), actual.end(), 0);
+    histogram_native_simd(values.data(), actual.data(), values.size(), bin_count);
+    if (expected != actual) throw std::runtime_error("histogram SIMD failed validation");
+
+    std::vector<std::uint32_t> bins(bin_count);
+    const auto benchmark = [&](const char* name, const HistogramKernel kernel) {
+        return measure(name,
+            [&] { std::fill(bins.begin(), bins.end(), 0); },
+            [&] { kernel(values.data(), bins.data(), values.size(), bin_count); },
+            [&] { return checksum(bins); },
+            iterations, samples,
+            3.0 * sizeof(std::uint32_t) * static_cast<double>(values.size()),
+            not_applicable);
+    };
+    print_triplet("Histogram-like update", benchmark("scalar", histogram_scalar),
+                  benchmark("auto-vectorized", histogram_auto),
+                  benchmark("manual/hybrid", histogram_native_simd));
 }
 
 } // namespace
 
-int main(const int argc, char** argv) {
+int main(int argc, char** argv) {
     try {
-        const Configuration configuration = parse_configuration(argc, argv);
+        const std::size_t vector_count = argc > 1 ? parse_positive_size(argv[1], "vector_count") : (std::size_t{1} << 20);
+        const std::size_t vector_iterations = argc > 2 ? parse_positive_size(argv[2], "vector_iterations") : 10;
+        const std::size_t samples = argc > 3 ? parse_positive_size(argv[3], "samples") : 5;
+        const std::size_t small_gemm_dimension = argc > 4 ? parse_positive_size(argv[4], "small_gemm_dimension") : 64;
+        const std::size_t large_gemm_dimension = argc > 5 ? parse_positive_size(argv[5], "large_gemm_dimension") : 256;
+        const std::size_t fft_size = argc > 6 ? parse_positive_size(argv[6], "fft_size") : (std::size_t{1} << 15);
 
-        std::vector<float> lhs(configuration.element_count);
-        std::vector<float> rhs(configuration.element_count);
+        if (samples % 2 == 0) throw std::invalid_argument("samples must be odd");
+        if (!is_power_of_two(fft_size)) throw std::invalid_argument("fft_size must be a power of two");
+        if (vector_count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::invalid_argument("vector_count must fit in signed 32-bit indices for AVX2 gather");
+        }
 
-        for (std::size_t i = 0; i < configuration.element_count; ++i) {
-            lhs[i] = 0.001F + static_cast<float>(i % 1024) * 0.0009F;
-            rhs[i] = 0.5F + static_cast<float>((i * 17) % 1024) * 0.0007F;
+        std::vector<float> lhs(vector_count);
+        std::vector<float> rhs(vector_count);
+        for (std::size_t i = 0; i < vector_count; ++i) {
+            lhs[i] = static_cast<float>(static_cast<int>(i % 1024) - 512) * 0.001F;
+            rhs[i] = 1.0F + static_cast<float>(static_cast<int>((i * 7) % 509) - 254) * 0.001F;
+        }
+
+        std::vector<std::uint32_t> gather_indices(vector_count);
+        const std::size_t scatter_bin_count = std::max<std::size_t>(256, vector_count / 16);
+        std::vector<std::uint32_t> scatter_indices(vector_count);
+        std::vector<std::uint32_t> histogram_values(vector_count);
+        for (std::size_t i = 0; i < vector_count; ++i) {
+            const std::uint64_t mixed = static_cast<std::uint64_t>(i) * 2654435761ULL + 1013904223ULL;
+            gather_indices[i] = static_cast<std::uint32_t>(mixed % vector_count);
+            scatter_indices[i] = static_cast<std::uint32_t>(mixed % scatter_bin_count);
+            histogram_values[i] = static_cast<std::uint32_t>((mixed >> 8) % 256);
         }
 
         std::cout << "SIMD benchmark suite\n"
-                  << "Native SIMD backend: " << native_simd_name() << '\n'
-                  << "Vector elements: " << configuration.element_count << '\n'
-                  << "Vector/convolution iterations per sample: "
-                  << configuration.vector_iterations << '\n'
-                  << "Matrix dimension: " << configuration.matrix_dimension << '\n'
-                  << "Matrix iterations per sample: " << configuration.matrix_iterations << '\n'
-                  << "Samples: " << configuration.samples << " (median reported)\n"
-                  << "GB/s* is shown only where a meaningful minimum streaming byte count exists.\n";
+                  << "Native backend: " << native_simd_name() << '\n'
+                  << "Vector elements: " << vector_count
+                  << ", vector iterations: " << vector_iterations
+                  << ", samples: " << samples << " (median)\n"
+                  << "Small GEMM: " << small_gemm_dimension << "x" << small_gemm_dimension
+                  << ", large GEMM: " << large_gemm_dimension << "x" << large_gemm_dimension
+                  << ", FFT size: " << fft_size << "\n";
 
-        run_binary_suite(
-            "Vector addition", "output[i] = lhs[i] + rhs[i]",
-            vector_add_scalar, vector_add_auto, vector_add_native_simd,
-            lhs, rhs, configuration.vector_iterations, configuration.samples);
+        run_unary_vector_kernel("STREAM copy", vector_copy_scalar, vector_copy_auto,
+                                vector_copy_native_simd, lhs, vector_iterations, samples,
+                                2.0 * sizeof(float), 0.0);
+        run_binary_vector_kernel("Vector addition", vector_add_scalar, vector_add_auto,
+                                 vector_add_native_simd, lhs, rhs, vector_iterations, samples, 1.0);
+        run_binary_vector_kernel("Vector subtraction", vector_subtract_scalar, vector_subtract_auto,
+                                 vector_subtract_native_simd, lhs, rhs, vector_iterations, samples, 1.0);
+        run_binary_vector_kernel("Vector multiplication", vector_multiply_scalar, vector_multiply_auto,
+                                 vector_multiply_native_simd, lhs, rhs, vector_iterations, samples, 1.0);
+        run_binary_vector_kernel("Vector division", vector_divide_scalar, vector_divide_auto,
+                                 vector_divide_native_simd, lhs, rhs, vector_iterations, samples, 1.0);
+        run_triad(lhs, rhs, vector_iterations, samples);
+        run_saxpy(lhs, rhs, vector_iterations, samples);
+        run_dot_product(lhs, rhs, vector_iterations, samples);
+        run_polynomial(lhs, vector_iterations, samples);
+        run_small_gemm(small_gemm_dimension, samples);
+        run_large_gemm(large_gemm_dimension, samples);
+        run_convolution(lhs, std::max<std::size_t>(1, vector_iterations / 2), samples);
+        run_fft(fft_size, samples);
+        run_gather(lhs, gather_indices, vector_iterations, samples);
+        run_scatter(lhs, scatter_indices, scatter_bin_count,
+                    std::max<std::size_t>(1, vector_iterations / 2), samples);
+        run_histogram(histogram_values, 256,
+                      std::max<std::size_t>(1, vector_iterations / 2), samples);
 
-        run_binary_suite(
-            "Vector subtraction", "output[i] = lhs[i] - rhs[i]",
-            vector_subtract_scalar, vector_subtract_auto, vector_subtract_native_simd,
-            lhs, rhs, configuration.vector_iterations, configuration.samples);
-
-        run_binary_suite(
-            "Vector multiplication", "output[i] = lhs[i] * rhs[i]",
-            vector_multiply_scalar, vector_multiply_auto, vector_multiply_native_simd,
-            lhs, rhs, configuration.vector_iterations, configuration.samples);
-
-        run_binary_suite(
-            "Vector division", "output[i] = lhs[i] / rhs[i]",
-            vector_divide_scalar, vector_divide_auto, vector_divide_native_simd,
-            lhs, rhs, configuration.vector_iterations, configuration.samples);
-
-        run_saxpy_suite(
-            lhs, rhs, configuration.vector_iterations, configuration.samples);
-
-        run_dot_suite(
-            lhs, rhs, configuration.vector_iterations, configuration.samples);
-
-        run_polynomial_suite(
-            lhs, configuration.vector_iterations, configuration.samples);
-
-        run_convolution_suite(
-            lhs, configuration.vector_iterations, configuration.samples);
-
-        run_matrix_suite(
-            configuration.matrix_dimension,
-            configuration.matrix_iterations,
-            configuration.samples);
-
-        std::cout << "\nAll implementations passed validation.\n";
+        std::cout << "\nAll validation checks passed.\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n'
-                  << "Usage: simd_benchmark [element_count] [vector_iterations] "
-                     "[odd_samples] [matrix_dimension] [matrix_iterations]\n";
+                  << "Usage: simd_benchmark [vector_count] [vector_iterations] [odd_samples] "
+                     "[small_gemm_dimension] [large_gemm_dimension] [fft_power_of_two]\n";
         return EXIT_FAILURE;
     }
 }
