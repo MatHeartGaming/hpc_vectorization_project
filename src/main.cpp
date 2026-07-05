@@ -2,17 +2,22 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <fstream>
 #include <iomanip>
+#include <map>
 #include <iostream>
 #include <limits>
 #include <numbers>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -42,6 +47,48 @@ struct BenchmarkResult {
     double checksum{};
 };
 
+struct CsvRow {
+    std::size_t run_id{};
+    std::string machine;
+    std::string backend;
+    std::string optimization;
+    std::string kernel_id;
+    std::string kernel;
+    std::string implementation;
+    double median_seconds{};
+    double baseline_median_seconds{};
+    double speedup{};
+    double gb_per_second{};
+    double gflops{};
+    double checksum{};
+};
+
+struct SummaryRow {
+    std::string machine;
+    std::string backend;
+    std::string optimization;
+    std::string kernel_id;
+    std::string kernel;
+    std::string implementation;
+    std::size_t runs{};
+    double mean_median_seconds{};
+    double stddev_median_seconds{};
+    double min_median_seconds{};
+    double max_median_seconds{};
+    double mean_speedup{};
+    double speedup_from_mean_scalar{};
+    double mean_gb_per_second{};
+    double mean_gflops{};
+    double mean_checksum{};
+};
+
+std::size_t g_kernel_warmups = 3;
+std::size_t g_current_run_id = 0;
+std::string g_machine_name = "unknown-machine";
+std::string g_optimization_name = "unknown";
+bool g_print_tables = false;
+std::vector<CsvRow> g_csv_rows;
+
 std::size_t parse_positive_size(const char* value, const char* name) {
     try {
         const auto parsed = std::stoull(value);
@@ -52,6 +99,49 @@ std::size_t parse_positive_size(const char* value, const char* name) {
     } catch (...) {
         throw std::invalid_argument(std::string(name) + " must be a positive integer");
     }
+}
+
+std::string sanitize_for_csv_id(const std::string& text) {
+    std::string result;
+    bool previous_was_separator = false;
+
+    for (const unsigned char character : text) {
+        if (std::isalnum(character)) {
+            result.push_back(static_cast<char>(std::tolower(character)));
+            previous_was_separator = false;
+        } else if (!previous_was_separator && !result.empty()) {
+            result.push_back('_');
+            previous_was_separator = true;
+        }
+    }
+
+    while (!result.empty() && result.back() == '_') result.pop_back();
+    return result.empty() ? "unknown_kernel" : result;
+}
+
+std::string canonical_implementation_name(const std::string& implementation) {
+    if (implementation == "scalar") return "scalar";
+    if (implementation == "auto-vectorized") return "auto";
+    return "native_simd";
+}
+
+std::string csv_escape(const std::string& value) {
+    if (value.find_first_of(",\"\n\r") == std::string::npos) return value;
+
+    std::string escaped = "\"";
+    for (const char character : value) {
+        if (character == '\"') escaped += "\"\"";
+        else escaped.push_back(character);
+    }
+    escaped += "\"";
+    return escaped;
+}
+
+std::string metric_to_csv(const double value, const bool negative_means_not_applicable = false) {
+    if (negative_means_not_applicable && value < 0.0) return "";
+    std::ostringstream stream;
+    stream << std::setprecision(17) << value;
+    return stream.str();
 }
 
 bool is_power_of_two(const std::size_t value) {
@@ -127,17 +217,34 @@ BenchmarkResult measure(
 ) {
     using Clock = std::chrono::steady_clock;
 
-    setup();
-    operation();
+    // Kernel-level warm-up: execute the same implementation with the same
+    // input size before collecting measured samples. Warm-up timings are
+    // intentionally discarded. setup() is called before every warm-up so
+    // mutable kernels such as SAXPY, FFT, scatter, and histogram start from
+    // the same logical state.
+    for (std::size_t warmup = 0; warmup < g_kernel_warmups; ++warmup) {
+        setup();
+        operation();
+    }
 
     std::vector<double> timings;
     timings.reserve(samples);
     for (std::size_t sample = 0; sample < samples; ++sample) {
-        setup();
-        const auto start = Clock::now();
-        for (std::size_t iteration = 0; iteration < iterations; ++iteration) operation();
-        const auto end = Clock::now();
-        timings.push_back(std::chrono::duration<double>(end - start).count());
+        double sample_seconds = 0.0;
+
+        // Each timing sample may execute the kernel multiple times. setup()
+        // is deliberately outside the timed region and is repeated for every
+        // iteration, which keeps mutable-output kernels comparable without
+        // charging input restoration to the kernel implementation.
+        for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
+            setup();
+            const auto start = Clock::now();
+            operation();
+            const auto end = Clock::now();
+            sample_seconds += std::chrono::duration<double>(end - start).count();
+        }
+
+        timings.push_back(sample_seconds);
     }
 
     std::sort(timings.begin(), timings.end());
@@ -167,12 +274,40 @@ void print_metric(
     }
 }
 
+void record_result_row(
+    const std::string& title,
+    const BenchmarkResult& scalar,
+    const BenchmarkResult& result
+) {
+    g_csv_rows.push_back({
+        .run_id = g_current_run_id,
+        .machine = g_machine_name,
+        .backend = native_simd_name(),
+        .optimization = g_optimization_name,
+        .kernel_id = sanitize_for_csv_id(title),
+        .kernel = title,
+        .implementation = canonical_implementation_name(result.implementation),
+        .median_seconds = result.seconds,
+        .baseline_median_seconds = scalar.seconds,
+        .speedup = scalar.seconds / result.seconds,
+        .gb_per_second = result.gb_per_second,
+        .gflops = result.gflops,
+        .checksum = result.checksum,
+    });
+}
+
 void print_triplet(
     const std::string& title,
     const BenchmarkResult& scalar,
     const BenchmarkResult& automatic,
     const BenchmarkResult& native
 ) {
+    record_result_row(title, scalar, scalar);
+    record_result_row(title, scalar, automatic);
+    record_result_row(title, scalar, native);
+
+    if (!g_print_tables) return;
+
     std::cout << "\n" << title << '\n'
               << std::left << std::setw(18) << "implementation"
               << std::right << std::setw(12) << "seconds"
@@ -610,81 +745,328 @@ void run_histogram(
                   benchmark("manual/hybrid", histogram_native_simd));
 }
 
+struct Options {
+    std::size_t vector_count = std::size_t{1} << 20;
+    std::size_t vector_iterations = 10;
+    std::size_t samples = 9;
+    std::size_t small_gemm_dimension = 64;
+    std::size_t large_gemm_dimension = 256;
+    std::size_t fft_size = std::size_t{1} << 15;
+    std::size_t full_runs = 20;
+    std::size_t warmups = 3;
+    std::string csv_prefix = "simd_results";
+    std::string machine = "unknown-machine";
+    std::string optimization = "Release/O3";
+    bool print_tables = false;
+};
+
+std::string usage() {
+    return
+        "Usage: simd_benchmark [vector_count] [vector_iterations] [odd_samples] "
+        "[small_gemm_dimension] [large_gemm_dimension] [fft_power_of_two] [options]\n"
+        "\n"
+        "Options:\n"
+        "  --runs <n>             Full benchmark campaigns to execute. Default: 20\n"
+        "  --warmups <n>          Untimed kernel-level warm-ups before each measured kernel. Default: 3\n"
+        "  --csv-prefix <prefix>  Output prefix. Default: simd_results\n"
+        "  --machine <name>       Machine label stored in CSV, e.g. M2 Pro\n"
+        "  --opt <name>           Optimization label stored in CSV, e.g. O3\n"
+        "  --print-tables         Print detailed tables for every full run\n"
+        "  --help                 Show this help message\n"
+        "\n"
+        "CSV output:\n"
+        "  <prefix>_medians.csv   One row per run/kernel/implementation median\n"
+        "  <prefix>_summary.csv   Mean of the per-run medians, ready for plotting\n";
+}
+
+Options parse_options(const int argc, char** argv) {
+    Options options;
+    std::vector<std::string> positional;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i];
+
+        const auto require_value = [&](const char* option_name) -> const char* {
+            if (i + 1 >= argc) {
+                throw std::invalid_argument(std::string(option_name) + " requires a value");
+            }
+            return argv[++i];
+        };
+
+        if (argument == "--help" || argument == "-h") {
+            std::cout << usage();
+            std::exit(EXIT_SUCCESS);
+        } else if (argument == "--runs") {
+            options.full_runs = parse_positive_size(require_value("--runs"), "runs");
+        } else if (argument == "--warmups") {
+            options.warmups = parse_positive_size(require_value("--warmups"), "warmups");
+        } else if (argument == "--csv-prefix") {
+            options.csv_prefix = require_value("--csv-prefix");
+        } else if (argument == "--machine") {
+            options.machine = require_value("--machine");
+        } else if (argument == "--opt") {
+            options.optimization = require_value("--opt");
+        } else if (argument == "--print-tables") {
+            options.print_tables = true;
+        } else if (!argument.empty() && argument[0] == '-') {
+            throw std::invalid_argument("unknown option: " + argument);
+        } else {
+            positional.push_back(argument);
+        }
+    }
+
+    if (positional.size() > 6) {
+        throw std::invalid_argument("too many positional arguments");
+    }
+
+    if (positional.size() > 0) options.vector_count = parse_positive_size(positional[0].c_str(), "vector_count");
+    if (positional.size() > 1) options.vector_iterations = parse_positive_size(positional[1].c_str(), "vector_iterations");
+    if (positional.size() > 2) options.samples = parse_positive_size(positional[2].c_str(), "samples");
+    if (positional.size() > 3) options.small_gemm_dimension = parse_positive_size(positional[3].c_str(), "small_gemm_dimension");
+    if (positional.size() > 4) options.large_gemm_dimension = parse_positive_size(positional[4].c_str(), "large_gemm_dimension");
+    if (positional.size() > 5) options.fft_size = parse_positive_size(positional[5].c_str(), "fft_size");
+
+    if (options.samples % 2 == 0) throw std::invalid_argument("samples must be odd");
+    if (!is_power_of_two(options.fft_size)) throw std::invalid_argument("fft_size must be a power of two");
+    if (options.vector_count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("vector_count must fit in signed 32-bit indices for AVX2 gather");
+    }
+
+    return options;
+}
+
+void write_medians_csv(const std::string& path) {
+    std::ofstream file(path);
+    if (!file) throw std::runtime_error("cannot open CSV file for writing: " + path);
+
+    file << "run_id,machine,backend,optimization,kernel_id,kernel,implementation,"
+            "median_seconds,baseline_median_seconds,speedup,gb_per_second,gflops,checksum\n";
+
+    for (const CsvRow& row : g_csv_rows) {
+        file << row.run_id << ','
+             << csv_escape(row.machine) << ','
+             << csv_escape(row.backend) << ','
+             << csv_escape(row.optimization) << ','
+             << csv_escape(row.kernel_id) << ','
+             << csv_escape(row.kernel) << ','
+             << csv_escape(row.implementation) << ','
+             << metric_to_csv(row.median_seconds) << ','
+             << metric_to_csv(row.baseline_median_seconds) << ','
+             << metric_to_csv(row.speedup) << ','
+             << metric_to_csv(row.gb_per_second, true) << ','
+             << metric_to_csv(row.gflops, true) << ','
+             << metric_to_csv(row.checksum) << '\n';
+    }
+}
+
+std::vector<SummaryRow> build_summary_rows() {
+    struct Accumulator {
+        std::vector<const CsvRow*> rows;
+    };
+
+    std::map<std::string, Accumulator> groups;
+    std::map<std::string, std::vector<double>> scalar_seconds_by_kernel;
+
+    for (const CsvRow& row : g_csv_rows) {
+        const std::string key = row.machine + "\x1f" + row.backend + "\x1f" + row.optimization + "\x1f" +
+                                row.kernel_id + "\x1f" + row.implementation;
+        groups[key].rows.push_back(&row);
+
+        if (row.implementation == "scalar") {
+            const std::string scalar_key = row.machine + "\x1f" + row.backend + "\x1f" +
+                                           row.optimization + "\x1f" + row.kernel_id;
+            scalar_seconds_by_kernel[scalar_key].push_back(row.median_seconds);
+        }
+    }
+
+    const auto mean = [](const std::vector<double>& values) {
+        double sum = 0.0;
+        for (const double value : values) sum += value;
+        return values.empty() ? 0.0 : sum / static_cast<double>(values.size());
+    };
+
+    const auto stddev = [&](const std::vector<double>& values, const double average) {
+        if (values.size() < 2) return 0.0;
+        double sum_squared = 0.0;
+        for (const double value : values) {
+            const double delta = value - average;
+            sum_squared += delta * delta;
+        }
+        return std::sqrt(sum_squared / static_cast<double>(values.size() - 1));
+    };
+
+    std::vector<SummaryRow> summaries;
+    summaries.reserve(groups.size());
+
+    for (const auto& [key, accumulator] : groups) {
+        const CsvRow& first = *accumulator.rows.front();
+
+        std::vector<double> seconds;
+        std::vector<double> speedups;
+        std::vector<double> gbps_values;
+        std::vector<double> gflops_values;
+        std::vector<double> checksums;
+        seconds.reserve(accumulator.rows.size());
+        speedups.reserve(accumulator.rows.size());
+
+        for (const CsvRow* row : accumulator.rows) {
+            seconds.push_back(row->median_seconds);
+            speedups.push_back(row->speedup);
+            if (row->gb_per_second >= 0.0) gbps_values.push_back(row->gb_per_second);
+            if (row->gflops >= 0.0) gflops_values.push_back(row->gflops);
+            checksums.push_back(row->checksum);
+        }
+
+        const double average_seconds = mean(seconds);
+        const std::string scalar_key = first.machine + "\x1f" + first.backend + "\x1f" +
+                                       first.optimization + "\x1f" + first.kernel_id;
+        const double average_scalar_seconds = mean(scalar_seconds_by_kernel[scalar_key]);
+
+        summaries.push_back({
+            .machine = first.machine,
+            .backend = first.backend,
+            .optimization = first.optimization,
+            .kernel_id = first.kernel_id,
+            .kernel = first.kernel,
+            .implementation = first.implementation,
+            .runs = accumulator.rows.size(),
+            .mean_median_seconds = average_seconds,
+            .stddev_median_seconds = stddev(seconds, average_seconds),
+            .min_median_seconds = *std::min_element(seconds.begin(), seconds.end()),
+            .max_median_seconds = *std::max_element(seconds.begin(), seconds.end()),
+            .mean_speedup = mean(speedups),
+            .speedup_from_mean_scalar = average_seconds > 0.0 ? average_scalar_seconds / average_seconds : 0.0,
+            .mean_gb_per_second = gbps_values.empty() ? not_applicable : mean(gbps_values),
+            .mean_gflops = gflops_values.empty() ? not_applicable : mean(gflops_values),
+            .mean_checksum = mean(checksums),
+        });
+    }
+
+    std::sort(summaries.begin(), summaries.end(), [](const SummaryRow& lhs, const SummaryRow& rhs) {
+        return std::tie(lhs.machine, lhs.kernel_id, lhs.implementation) <
+               std::tie(rhs.machine, rhs.kernel_id, rhs.implementation);
+    });
+
+    return summaries;
+}
+
+void write_summary_csv(const std::string& path) {
+    std::ofstream file(path);
+    if (!file) throw std::runtime_error("cannot open CSV file for writing: " + path);
+
+    file << "machine,backend,optimization,kernel_id,kernel,implementation,runs,"
+            "mean_median_seconds,stddev_median_seconds,min_median_seconds,max_median_seconds,"
+            "mean_speedup,speedup_from_mean_scalar,mean_gb_per_second,mean_gflops,mean_checksum\n";
+
+    for (const SummaryRow& row : build_summary_rows()) {
+        file << csv_escape(row.machine) << ','
+             << csv_escape(row.backend) << ','
+             << csv_escape(row.optimization) << ','
+             << csv_escape(row.kernel_id) << ','
+             << csv_escape(row.kernel) << ','
+             << csv_escape(row.implementation) << ','
+             << row.runs << ','
+             << metric_to_csv(row.mean_median_seconds) << ','
+             << metric_to_csv(row.stddev_median_seconds) << ','
+             << metric_to_csv(row.min_median_seconds) << ','
+             << metric_to_csv(row.max_median_seconds) << ','
+             << metric_to_csv(row.mean_speedup) << ','
+             << metric_to_csv(row.speedup_from_mean_scalar) << ','
+             << metric_to_csv(row.mean_gb_per_second, true) << ','
+             << metric_to_csv(row.mean_gflops, true) << ','
+             << metric_to_csv(row.mean_checksum) << '\n';
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
-        const std::size_t vector_count = argc > 1 ? parse_positive_size(argv[1], "vector_count") : (std::size_t{1} << 20);
-        const std::size_t vector_iterations = argc > 2 ? parse_positive_size(argv[2], "vector_iterations") : 10;
-        const std::size_t samples = argc > 3 ? parse_positive_size(argv[3], "samples") : 5;
-        const std::size_t small_gemm_dimension = argc > 4 ? parse_positive_size(argv[4], "small_gemm_dimension") : 64;
-        const std::size_t large_gemm_dimension = argc > 5 ? parse_positive_size(argv[5], "large_gemm_dimension") : 256;
-        const std::size_t fft_size = argc > 6 ? parse_positive_size(argv[6], "fft_size") : (std::size_t{1} << 15);
+        const Options options = parse_options(argc, argv);
 
-        if (samples % 2 == 0) throw std::invalid_argument("samples must be odd");
-        if (!is_power_of_two(fft_size)) throw std::invalid_argument("fft_size must be a power of two");
-        if (vector_count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-            throw std::invalid_argument("vector_count must fit in signed 32-bit indices for AVX2 gather");
-        }
+        g_kernel_warmups = options.warmups;
+        g_machine_name = options.machine;
+        g_optimization_name = options.optimization;
+        g_print_tables = options.print_tables;
+        g_csv_rows.clear();
 
-        std::vector<float> lhs(vector_count);
-        std::vector<float> rhs(vector_count);
-        for (std::size_t i = 0; i < vector_count; ++i) {
+        std::vector<float> lhs(options.vector_count);
+        std::vector<float> rhs(options.vector_count);
+        for (std::size_t i = 0; i < options.vector_count; ++i) {
             lhs[i] = static_cast<float>(static_cast<int>(i % 1024) - 512) * 0.001F;
             rhs[i] = 1.0F + static_cast<float>(static_cast<int>((i * 7) % 509) - 254) * 0.001F;
         }
 
-        std::vector<std::uint32_t> gather_indices(vector_count);
-        const std::size_t scatter_bin_count = std::max<std::size_t>(256, vector_count / 16);
-        std::vector<std::uint32_t> scatter_indices(vector_count);
-        std::vector<std::uint32_t> histogram_values(vector_count);
-        for (std::size_t i = 0; i < vector_count; ++i) {
+        std::vector<std::uint32_t> gather_indices(options.vector_count);
+        const std::size_t scatter_bin_count = std::max<std::size_t>(256, options.vector_count / 16);
+        std::vector<std::uint32_t> scatter_indices(options.vector_count);
+        std::vector<std::uint32_t> histogram_values(options.vector_count);
+        for (std::size_t i = 0; i < options.vector_count; ++i) {
             const std::uint64_t mixed = static_cast<std::uint64_t>(i) * 2654435761ULL + 1013904223ULL;
-            gather_indices[i] = static_cast<std::uint32_t>(mixed % vector_count);
+            gather_indices[i] = static_cast<std::uint32_t>(mixed % options.vector_count);
             scatter_indices[i] = static_cast<std::uint32_t>(mixed % scatter_bin_count);
             histogram_values[i] = static_cast<std::uint32_t>((mixed >> 8) % 256);
         }
 
         std::cout << "SIMD benchmark suite\n"
+                  << "Machine label: " << options.machine << '\n'
                   << "Native backend: " << native_simd_name() << '\n'
-                  << "Vector elements: " << vector_count
-                  << ", vector iterations: " << vector_iterations
-                  << ", samples: " << samples << " (median)\n"
-                  << "Small GEMM: " << small_gemm_dimension << "x" << small_gemm_dimension
-                  << ", large GEMM: " << large_gemm_dimension << "x" << large_gemm_dimension
-                  << ", FFT size: " << fft_size << "\n";
+                  << "Optimization label: " << options.optimization << '\n'
+                  << "Vector elements: " << options.vector_count
+                  << ", vector iterations: " << options.vector_iterations
+                  << ", samples per run: " << options.samples << " (median)\n"
+                  << "Full runs: " << options.full_runs
+                  << ", kernel warm-ups per implementation: " << options.warmups << "\n"
+                  << "Small GEMM: " << options.small_gemm_dimension << "x" << options.small_gemm_dimension
+                  << ", large GEMM: " << options.large_gemm_dimension << "x" << options.large_gemm_dimension
+                  << ", FFT size: " << options.fft_size << "\n";
 
-        run_unary_vector_kernel("STREAM copy", vector_copy_scalar, vector_copy_auto,
-                                vector_copy_native_simd, lhs, vector_iterations, samples,
-                                2.0 * sizeof(float), 0.0);
-        run_binary_vector_kernel("Vector addition", vector_add_scalar, vector_add_auto,
-                                 vector_add_native_simd, lhs, rhs, vector_iterations, samples, 1.0);
-        run_binary_vector_kernel("Vector subtraction", vector_subtract_scalar, vector_subtract_auto,
-                                 vector_subtract_native_simd, lhs, rhs, vector_iterations, samples, 1.0);
-        run_binary_vector_kernel("Vector multiplication", vector_multiply_scalar, vector_multiply_auto,
-                                 vector_multiply_native_simd, lhs, rhs, vector_iterations, samples, 1.0);
-        run_binary_vector_kernel("Vector division", vector_divide_scalar, vector_divide_auto,
-                                 vector_divide_native_simd, lhs, rhs, vector_iterations, samples, 1.0);
-        run_triad(lhs, rhs, vector_iterations, samples);
-        run_saxpy(lhs, rhs, vector_iterations, samples);
-        run_dot_product(lhs, rhs, vector_iterations, samples);
-        run_polynomial(lhs, vector_iterations, samples);
-        run_small_gemm(small_gemm_dimension, samples);
-        run_large_gemm(large_gemm_dimension, samples);
-        run_convolution(lhs, std::max<std::size_t>(1, vector_iterations / 2), samples);
-        run_fft(fft_size, samples);
-        run_gather(lhs, gather_indices, vector_iterations, samples);
-        run_scatter(lhs, scatter_indices, scatter_bin_count,
-                    std::max<std::size_t>(1, vector_iterations / 2), samples);
-        run_histogram(histogram_values, 256,
-                      std::max<std::size_t>(1, vector_iterations / 2), samples);
+        for (std::size_t run_id = 1; run_id <= options.full_runs; ++run_id) {
+            g_current_run_id = run_id;
+            g_print_tables = options.print_tables;
 
-        std::cout << "\nAll validation checks passed.\n";
+            std::cout << "\nFull benchmark run " << run_id << '/' << options.full_runs << "..." << std::flush;
+
+            run_unary_vector_kernel("STREAM copy", vector_copy_scalar, vector_copy_auto,
+                                    vector_copy_native_simd, lhs, options.vector_iterations, options.samples,
+                                    2.0 * sizeof(float), 0.0);
+            run_binary_vector_kernel("Vector addition", vector_add_scalar, vector_add_auto,
+                                     vector_add_native_simd, lhs, rhs, options.vector_iterations, options.samples, 1.0);
+            run_binary_vector_kernel("Vector subtraction", vector_subtract_scalar, vector_subtract_auto,
+                                     vector_subtract_native_simd, lhs, rhs, options.vector_iterations, options.samples, 1.0);
+            run_binary_vector_kernel("Vector multiplication", vector_multiply_scalar, vector_multiply_auto,
+                                     vector_multiply_native_simd, lhs, rhs, options.vector_iterations, options.samples, 1.0);
+            run_binary_vector_kernel("Vector division", vector_divide_scalar, vector_divide_auto,
+                                     vector_divide_native_simd, lhs, rhs, options.vector_iterations, options.samples, 1.0);
+            run_triad(lhs, rhs, options.vector_iterations, options.samples);
+            run_saxpy(lhs, rhs, options.vector_iterations, options.samples);
+            run_dot_product(lhs, rhs, options.vector_iterations, options.samples);
+            run_polynomial(lhs, options.vector_iterations, options.samples);
+            run_small_gemm(options.small_gemm_dimension, options.samples);
+            run_large_gemm(options.large_gemm_dimension, options.samples);
+            run_convolution(lhs, std::max<std::size_t>(1, options.vector_iterations / 2), options.samples);
+            run_fft(options.fft_size, options.samples);
+            run_gather(lhs, gather_indices, options.vector_iterations, options.samples);
+            run_scatter(lhs, scatter_indices, scatter_bin_count,
+                        std::max<std::size_t>(1, options.vector_iterations / 2), options.samples);
+            run_histogram(histogram_values, 256,
+                          std::max<std::size_t>(1, options.vector_iterations / 2), options.samples);
+
+            std::cout << " done" << std::endl;
+        }
+
+        const std::string medians_csv_path = options.csv_prefix + "_medians.csv";
+        const std::string summary_csv_path = options.csv_prefix + "_summary.csv";
+        write_medians_csv(medians_csv_path);
+        write_summary_csv(summary_csv_path);
+
+        std::cout << "\nAll validation checks passed.\n"
+                  << "Wrote per-run medians to: " << medians_csv_path << '\n'
+                  << "Wrote mean-of-medians summary to: " << summary_csv_path << '\n';
+
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
-        std::cerr << "Error: " << error.what() << '\n'
-                  << "Usage: simd_benchmark [vector_count] [vector_iterations] [odd_samples] "
-                     "[small_gemm_dimension] [large_gemm_dimension] [fft_power_of_two]\n";
+        std::cerr << "Error: " << error.what() << "\n\n" << usage();
         return EXIT_FAILURE;
     }
 }
